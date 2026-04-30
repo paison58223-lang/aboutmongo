@@ -1,0 +1,354 @@
+Sub MongoDB_Import()
+    Dim lastRow As Long
+    Dim i As Long
+    Dim cmd As String
+    Dim dataString As String
+    Dim filePath As String
+    Dim wsh As Object
+    Dim insertfile As String
+    Dim targetbook As Workbook
+    Dim targetsheet As Worksheet
+    
+    Application.ScreenUpdating = False
+    
+    insertfile = ThisWorkbook.Worksheets("Sheet2").Range("G3")
+    
+    On Error Resume Next
+        Set targetbook = Workbooks.Open(Filename:=insertfile, ReadOnly:=True)
+    On Error GoTo 0
+    
+    If targetbook Is Nothing Then
+        MsgBox "ファイルを開けませんでした。パスを確認してください。", vbCritical
+        Application.ScreenUpdating = True
+        Exit Sub
+    End If
+    
+    Set targetsheet = targetbook.Worksheets(1)
+    filePath = ThisWorkbook.Path & "\import_command.js"
+    
+    With targetsheet
+        lastRow = .Cells(.Rows.Count, "A").End(xlUp).Row
+        dataString = "use('BusinessDemo');" & vbCrLf
+        dataString = dataString & "db.StaffList.insertMany([" & vbCrLf
+        
+        Dim cellVal As String
+        Dim j As Integer
+        Dim keys As Variant: keys = Array("_id", "name", "email", "role")
+        
+        For i = 2 To lastRow
+            dataString = dataString & "  {"
+            For j = 0 To 3
+                cellVal = Trim(CStr(.Cells(i, j + 1).Value))
+                cellVal = Application.WorksheetFunction.Clean(cellVal)
+                cellVal = Replace(cellVal, vbCr, "")
+                cellVal = Replace(cellVal, vbLf, "")
+                cellVal = Replace(cellVal, "\", "\\")
+                cellVal = Replace(cellVal, """", "\""")
+                dataString = dataString & """" & keys(j) & """: """ & cellVal & """"
+                If j < 3 Then dataString = dataString & ", "
+            Next j
+            dataString = dataString & "}"
+            If i < lastRow Then dataString = dataString & ","
+            dataString = dataString & vbCrLf
+        Next i
+        dataString = dataString & "]);" & vbCrLf
+    End With
+        
+    With CreateObject("ADODB.Stream")
+        .Type = 2: .Charset = "UTF-8": .Open
+        .WriteText dataString
+        .SaveToFile filePath, 2: .Close
+    End With
+    
+    ' 5. インポート実行
+    cmd = "mongosh BusinessDemo """ & filePath & """"
+    Set wsh = CreateObject("WScript.Shell")
+    
+    ' 【重要】第3引数をTrueにすると、インポートが終わるまで待機します
+    wsh.Run "cmd /c " & cmd, 1, True
+    
+    targetbook.Close SaveChanges:=False
+    
+    ' 件数取得を呼び出す
+    Call TargetCount
+    
+    Application.ScreenUpdating = True
+End Sub
+
+Sub TargetCount()
+    Dim countFilePath As String
+    Dim countCmd As String
+    Dim totalCount As String
+    Dim dataString As String
+    Dim wsh As Object
+    
+    countFilePath = ThisWorkbook.Path & "\count_command.js"
+    dataString = "use('BusinessDemo');" & vbCrLf & _
+                 "print(db.StaffList.countDocuments());"
+                 
+    With CreateObject("ADODB.Stream")
+        .Type = 2: .Charset = "UTF-8": .Open
+        .WriteText dataString
+        .SaveToFile countFilePath, 2: .Close
+    End With
+    
+    ' --- ここを修正：wshをセットする ---
+    Set wsh = CreateObject("WScript.Shell")
+    countCmd = "mongosh --quiet BusinessDemo """ & countFilePath & """"
+    
+    ' Execメソッドで標準出力を受け取る
+    Dim exec As Object
+    Set exec = wsh.exec("cmd /c " & countCmd)
+    totalCount = exec.StdOut.ReadAll
+    
+    Dim cleanCount As String
+    cleanCount = Trim(totalCount)
+    cleanCount = Replace(cleanCount, vbCr, "")
+    cleanCount = Replace(cleanCount, vbLf, "")
+
+    ' シートに書き出し
+    ThisWorkbook.Worksheets("Sheet2").Range("G5").Value = cleanCount
+        
+    Kill countFilePath
+End Sub
+
+Sub MongoDB_Export()
+    Dim exportFilePath As String
+    Dim tempJsonPath As String
+    Dim cmd As String
+    Dim wsh As Object
+    Dim dataString As String
+    Dim jsonResult As String
+    
+    Application.ScreenUpdating = False
+    
+    ' 1. 命令書（JSファイル）を作成
+    exportFilePath = ThisWorkbook.Path & "\export_command.js"
+    tempJsonPath = ThisWorkbook.Path & "\temp_data.json"
+    
+    dataString = "use('BusinessDemo');" & vbCrLf & _
+                 "print(JSON.stringify(db.StaffList.find().toArray()));"
+    
+    ' 命令書をUTF-8で保存
+    With CreateObject("ADODB.Stream")
+        .Type = 2: .Charset = "UTF-8": .Open
+        .WriteText dataString
+        .SaveToFile exportFilePath, 2: .Close
+    End With
+    
+    ' 2. mongoshを実行し、結果をファイルへリダイレクト（>）して保存
+    Set wsh = CreateObject("WScript.Shell")
+    ' 出力結果を一時ファイル(temp_data.json)に保存させる
+    cmd = "cmd /c mongosh --quiet BusinessDemo """ & exportFilePath & """ > """ & tempJsonPath & """"
+    wsh.Run cmd, 0, True ' 完了まで待機
+    
+    ' 3. 【ここが重要！】保存されたUTF-8ファイルをADODB.Streamで正しく読み込む
+    With CreateObject("ADODB.Stream")
+        .Type = 2: .Charset = "UTF-8": .Open
+        .LoadFromFile tempJsonPath
+        jsonResult = .ReadText
+        .Close
+    End With
+    
+    ' 4. シートの準備
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+    ws.Name = "Export_" & Format(Now, "hhmmss")
+    ws.Range("A1:D1").Value = Array("_id", "name", "email", "role")
+    ws.Range("A1:D1").Font.Bold = True
+    
+    ' 5. パース処理
+    If InStr(jsonResult, "[{") > 0 Then
+        Dim lines As Variant, line As Variant
+        Dim keys As Variant: keys = Array("_id", "name", "email", "role")
+        Dim k As Integer, rowIdx As Long: rowIdx = 2
+        
+        lines = Split(jsonResult, "},{")
+        
+        For Each line In lines
+            For k = 0 To 3
+                On Error Resume Next
+                ' 文字列抽出
+                Dim tmp As String
+                tmp = Split(Split(line, """" & keys(k) & """:""")(1), """")(0)
+                ' 特殊文字の復元（もしあれば）
+                tmp = Replace(tmp, "\\", "\")
+                ws.Cells(rowIdx, k + 1).Value = tmp
+                On Error GoTo 0
+            Next k
+            rowIdx = rowIdx + 1
+        Next line
+        
+        ws.Columns("A:D").AutoFit
+        'MsgBox "文字化けなしで " & (rowIdx - 2) & " 件エクスポートしました！", vbInformation
+    End If
+    
+    ' 後始末
+    Kill exportFilePath
+    Kill tempJsonPath
+    Application.ScreenUpdating = True
+End Sub
+
+Sub MongoDB_SearchByID()
+    Dim searchID As String
+    Dim queryPath As String
+    Dim resultPath As String
+    Dim dataString As String
+    Dim jsonResult As String
+    Dim wsh As Object
+    
+    ' 1. 検索するIDを取得（G18）
+    searchID = Trim(ThisWorkbook.Worksheets("Sheet2").Range("G18").Value)
+    
+    If searchID = "" Then
+        MsgBox "スタッフNoを入力してください。", vbExclamation
+        Exit Sub
+    End If
+    
+    ' 2. パス設定
+    queryPath = ThisWorkbook.Path & "\search_command.js"
+    resultPath = ThisWorkbook.Path & "\search_result.json"
+    
+    ' 3. 検索命令（JS）の作成
+    ' findOne を使って1件だけ、かつ特定のIDを指定
+    dataString = "use('BusinessDemo');" & vbCrLf & _
+                 "print(JSON.stringify(db.StaffList.findOne({_id: '" & searchID & "'})));"
+    
+    ' UTF-8で保存
+    With CreateObject("ADODB.Stream")
+        .Type = 2: .Charset = "UTF-8": .Open
+        .WriteText dataString
+        .SaveToFile queryPath, 2: .Close
+    End With
+    
+    ' 4. mongosh実行（結果をファイルへリダイレクト）
+    Set wsh = CreateObject("WScript.Shell")
+    wsh.Run "cmd /c mongosh --quiet BusinessDemo """ & queryPath & """ > """ & resultPath & """", 0, True
+    
+    ' 5. 結果の読み込み
+    With CreateObject("ADODB.Stream")
+        .Type = 2: .Charset = "UTF-8": .Open
+        .LoadFromFile resultPath
+        jsonResult = .ReadText
+        .Close
+    End With
+    
+    ' 6. 結果の出力（G19, G20, G21）
+    With ThisWorkbook.Worksheets("Sheet2")
+        ' 既存の表示をクリア
+        .Range("G19:G21").ClearContents
+        
+        If jsonResult <> "null" And InStr(jsonResult, "{") > 0 Then
+            ' 文字列から必要な項目を引っこ抜く（山崎さん流・力技パース！）
+            .Range("G19").Value = Split(Split(jsonResult, """name"":""")(1), """")(0)
+            .Range("G20").Value = Split(Split(jsonResult, """email"":""")(1), """")(0)
+            .Range("G21").Value = Split(Split(jsonResult, """role"":""")(1), """")(0)
+        Else
+            MsgBox "該当するスタッフが見つかりません。", vbInformation
+        End If
+    End With
+    
+    ' 後始末
+    On Error Resume Next
+    Kill queryPath
+    Kill resultPath
+End Sub
+
+Sub MongoDB_UpsertData()
+    Dim searchID As String
+    Dim queryPath As String
+    Dim dataString As String
+    Dim wsh As Object
+    Dim nameVal As String, emailVal As String, roleVal As String
+    
+    ' 1. 入力値を取得
+    With ThisWorkbook.Worksheets("Sheet2")
+        searchID = Trim(.Range("G18").Value)
+        nameVal = Trim(.Range("G19").Value)
+        emailVal = Trim(.Range("G20").Value)
+        roleVal = Trim(.Range("G21").Value)
+    End With
+    
+    If searchID = "" Then
+        MsgBox "スタッフNo（G18）を入力してください。", vbExclamation: Exit Sub
+    End If
+    
+    ' 2. 命令書（JS）の作成
+    queryPath = ThisWorkbook.Path & "\upsert_command.js"
+    
+    ' updateOneの第3引数に { upsert: true } を指定するのがコツです
+    dataString = "use('BusinessDemo');" & vbCrLf & _
+                 "db.StaffList.updateOne(" & vbCrLf & _
+                 "  { _id: '" & searchID & "' }," & vbCrLf & _
+                 "  { $set: {" & vbCrLf & _
+                 "      name: '" & nameVal & "'," & vbCrLf & _
+                 "      email: '" & emailVal & "'," & vbCrLf & _
+                 "      role: '" & roleVal & "'" & vbCrLf & _
+                 "  }}," & vbCrLf & _
+                 "  { upsert: true }" & vbCrLf & _
+                 ");"
+    
+    ' UTF-8で保存
+    With CreateObject("ADODB.Stream")
+        .Type = 2: .Charset = "UTF-8": .Open
+        .WriteText dataString: .SaveToFile queryPath, 2: .Close
+    End With
+    
+    ' 3. mongosh実行
+    Set wsh = CreateObject("WScript.Shell")
+    wsh.Run "cmd /c mongosh --quiet BusinessDemo """ & queryPath & """", 0, True
+    
+    ' 4. 後始末
+    On Error Resume Next
+    Kill queryPath
+    
+    ' 5. 最新の件数を更新（既存のTargetCountを再利用）
+    Call TargetCount
+    
+    MsgBox "スタッフNo: " & searchID & " の登録・更新が完了しました！", vbInformation
+End Sub
+
+
+' ネットワーク状態を確認するためのAPI宣言（64bit版に完全固定）
+Private Declare PtrSafe Function InternetGetConnectedState Lib "wininet.dll" _
+    (ByRef dwFlags As Long, ByVal dwReserved As Long) As Long
+
+Private Sub Worksheet_BeforeDoubleClick(ByVal Target As Range, Cancel As Boolean)
+    ' ダブルクリックしたセルの値が「登録」の時だけ実行
+    If Target.Value <> "登録" Then Exit Sub
+    
+    ' 2. ネットワーク接続チェック
+    If InternetGetConnectedState(0&, 0&) = 0 Then
+        MsgBox "ネットワークに接続されていません。" & vbCrLf & _
+               "オンライン環境で実行してください。", vbCritical, "接続エラー"
+        Exit Sub
+    End If
+
+    ' 編集モードをキャンセル
+    Cancel = True
+
+    Dim fd As FileDialog
+    Dim selectedFile As String
+    
+    ' 3. Googleドライブのパスを特定
+    Dim gdPath As String
+    gdPath = "G:\マイドライブ\"
+    
+    Set fd = Application.FileDialog(msoFileDialogFilePicker)
+    
+    With fd
+        .Title = "レシート画像を選択してください"
+        .InitialFileName = gdPath ' ★ここがポイント：初期フォルダを指定
+        
+        If .Show = True Then
+            ' 3. 左隣のセルに「パス」をテキストとして書き込む（ハイパーリンク化しない）
+            Target.Offset(0, -1).Value = .SelectedItems(1)
+        End If
+        
+    End With
+End Sub
+
+
+
+
+
